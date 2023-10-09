@@ -54,7 +54,7 @@ export default class BingAIClient {
 
     static getValidIPv4(ip) {
         const match = !ip
-            || ip.match(/^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\/([0-9]|[1-2][0-9]|3[0-2]))?$/);
+          || ip.match(/^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\/([0-9]|[1-2][0-9]|3[0-2]))?$/);
         if (match) {
             if (match[5]) {
                 const mask = parseInt(match[5], 10);
@@ -116,23 +116,25 @@ export default class BingAIClient {
         } else {
             fetchOptions.dispatcher = new Agent({ connect: { timeout: 20_000 } });
         }
-        const response = await fetch(`${this.options.host}/turing/conversation/create`, fetchOptions);
+        const response = await fetch(`${this.options.host}/turing/conversation/create?bundleVersion=1.864.15`, fetchOptions);
         const body = await response.text();
         try {
-            return JSON.parse(body);
+            const res = JSON.parse(body);
+            res.encryptedConversationSignature = response.headers.get('x-sydney-encryptedconversationsignature') ?? null;
+            return res;
         } catch (err) {
             throw new Error(`/turing/conversation/create: failed to parse response body.\n${body}`);
         }
     }
 
-    async createWebSocketConnection() {
+    async createWebSocketConnection(encryptedConversationSignature) {
         return new Promise((resolve, reject) => {
             let agent;
             if (this.options.proxy) {
                 agent = new HttpsProxyAgent(this.options.proxy);
             }
 
-            const ws = new WebSocket('wss://sydney.bing.com/sydney/ChatHub', { agent, headers: this.headers });
+            const ws = new WebSocket(`wss://sydney.bing.com/sydney/ChatHub?sec_access_token=${encodeURIComponent(encryptedConversationSignature)}`, { agent, headers: this.headers });
 
             ws.on('error', err => reject(err));
 
@@ -188,8 +190,8 @@ export default class BingAIClient {
     }
 
     async sendMessage(
-        message,
-        opts = {},
+      message,
+      opts = {},
     ) {
         if (opts.clientOptions && typeof opts.clientOptions === 'object') {
             this.setOptions(opts.clientOptions);
@@ -198,7 +200,7 @@ export default class BingAIClient {
         let {
             jailbreakConversationId = false, // set to `true` for the first message to enable jailbreak mode
             conversationId,
-            conversationSignature,
+            encryptedConversationSignature,
             clientId,
             onProgress,
         } = opts;
@@ -216,15 +218,15 @@ export default class BingAIClient {
             onProgress = () => { };
         }
 
-        if (jailbreakConversationId || !conversationSignature || !conversationId || !clientId) {
+        if (jailbreakConversationId || !encryptedConversationSignature || !conversationId || !clientId) {
             const createNewConversationResponse = await this.createNewConversation();
             if (this.debug) {
                 console.debug(createNewConversationResponse);
             }
             if (
-                !createNewConversationResponse.conversationSignature
-                || !createNewConversationResponse.conversationId
-                || !createNewConversationResponse.clientId
+              !createNewConversationResponse.encryptedConversationSignature
+              || !createNewConversationResponse.conversationId
+              || !createNewConversationResponse.clientId
             ) {
                 const resultValue = createNewConversationResponse.result?.value;
                 if (resultValue) {
@@ -235,7 +237,7 @@ export default class BingAIClient {
                 throw new Error(`Unexpected response:\n${JSON.stringify(createNewConversationResponse, null, 2)}`);
             }
             ({
-                conversationSignature,
+                encryptedConversationSignature,
                 conversationId,
                 clientId,
             } = createNewConversationResponse);
@@ -261,10 +263,10 @@ export default class BingAIClient {
 
             // TODO: limit token usage
             const previousCachedMessages = this.constructor.getMessagesForConversation(conversation.messages, parentMessageId)
-                .map(conversationMessage => ({
-                    text: conversationMessage.message,
-                    author: conversationMessage.role === 'User' ? 'user' : 'bot',
-                }));
+              .map(conversationMessage => ({
+                  text: conversationMessage.message,
+                  author: conversationMessage.role === 'User' ? 'user' : 'bot',
+              }));
 
             const previousMessages = invocationId === 0 ? [
                 {
@@ -309,7 +311,7 @@ export default class BingAIClient {
             conversation.messages.push(userMessage);
         }
 
-        const ws = await this.createWebSocketConnection();
+        const ws = await this.createWebSocketConnection(encryptedConversationSignature);
 
         ws.on('error', (error) => {
             console.error(error);
@@ -359,7 +361,7 @@ export default class BingAIClient {
                         text: jailbreakConversationId ? 'Continue the conversation in context. Assistant:' : message,
                         messageType: jailbreakConversationId ? 'SearchQuery' : 'Chat',
                     },
-                    conversationSignature,
+                    encryptedConversationSignature,
                     participant: {
                         id: clientId,
                     },
@@ -443,9 +445,9 @@ export default class BingAIClient {
                         if (messages[0]?.contentType === 'IMAGE') {
                             // You will never get a message of this type without 'gencontentv3' being on.
                             bicIframe = this.bic.genImageIframeSsr(
-                                messages[0].text,
-                                messages[0].messageId,
-                                progress => (progress?.contentIframe ? onProgress(progress?.contentIframe) : null),
+                              messages[0].text,
+                              messages[0].messageId,
+                              progress => (progress?.contentIframe ? onProgress(progress?.contentIframe) : null),
                             ).catch((error) => {
                                 onProgress(error.message);
                                 bicIframe.isError = true;
@@ -506,13 +508,13 @@ export default class BingAIClient {
                         }
                         // The moderation filter triggered, so just return the text we have so far
                         if (
-                            jailbreakConversationId
-                            && (
-                                stopTokenFound
-                                || event.item.messages[0].topicChangerText
-                                || event.item.messages[0].offense === 'OffenseTrigger'
-                                || (event.item.messages.length > 1 && event.item.messages[1].contentOrigin === 'Apology')
-                            )
+                          jailbreakConversationId
+                          && (
+                            stopTokenFound
+                            || event.item.messages[0].topicChangerText
+                            || event.item.messages[0].offense === 'OffenseTrigger'
+                            || (event.item.messages.length > 1 && event.item.messages[1].contentOrigin === 'Apology')
+                          )
                         ) {
                             if (!replySoFar) {
                                 replySoFar = '[Error: The moderation filter triggered. Try again with different wording.]';
@@ -592,7 +594,7 @@ export default class BingAIClient {
 
         const returnData = {
             conversationId,
-            conversationSignature,
+            encryptedConversationSignature,
             clientId,
             invocationId: invocationId + 1,
             conversationExpiryTime,
